@@ -1,16 +1,23 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../models/message.dart';
+import '../models/attachment.dart';
 import '../services/chat_service.dart';
+import 'conversation_controller.dart';
 
 /// Controlador principal del chat con scroll inteligente y streaming
 class ChatController extends ChangeNotifier {
   final ChatService _chatService = ChatService();
   final ScrollController scrollController = ScrollController();
+  ConversationController? _conversationController;
 
   // Estado de mensajes
   final List<Message> _messages = [];
   List<Message> get messages => List.unmodifiable(_messages);
+
+  // Attachments pendientes
+  List<Attachment> _pendingAttachments = [];
+  List<Attachment> get pendingAttachments => List.unmodifiable(_pendingAttachments);
 
   // Estado de scroll
   bool _isAtBottom = true;
@@ -43,6 +50,31 @@ class ChatController extends ChangeNotifier {
 
   ChatController() {
     scrollController.addListener(_onScroll);
+  }
+
+  /// Conecta con el controlador de conversaciones
+  void setConversationController(ConversationController controller) {
+    _conversationController = controller;
+  }
+
+  /// Carga los mensajes de la conversación activa
+  void loadActiveConversation() {
+    if (_conversationController == null) return;
+
+    _messages.clear();
+    final activeMessages = _conversationController!.getActiveMessages();
+    _messages.addAll(activeMessages);
+    _historyPage = 0;
+    _hasMoreHistory = false; // Por ahora sin historial en conversaciones existentes
+    _isAtBottom = true;
+    _hasNewMessages = false;
+
+    notifyListeners();
+
+    // Scroll al final después de cargar
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      scrollToBottom(animated: false);
+    });
   }
 
   /// Listener de scroll para detectar posición
@@ -113,28 +145,41 @@ class ChatController extends ChangeNotifier {
     }
   }
 
-  /// Envía un mensaje del usuario
-  Future<void> sendMessage(String content) async {
-    if (content.trim().isEmpty || _isStreaming) return;
+  /// Envía un mensaje del usuario con attachments opcionales
+  Future<void> sendMessage(String content, [List<Attachment>? attachments]) async {
+    if ((content.trim().isEmpty && (attachments?.isEmpty ?? true)) || _isStreaming) return;
+
+    // Construir contenido con información de archivos adjuntos
+    String fullContent = content.trim();
+    if (attachments != null && attachments.isNotEmpty) {
+      final attachmentInfo = attachments
+          .map((a) => '[Archivo: ${a.name}]')
+          .join(' ');
+      fullContent = attachmentInfo + (fullContent.isNotEmpty ? '\n$fullContent' : '');
+    }
 
     // Agregar mensaje del usuario
     final userMessage = Message(
       role: MessageRole.user,
-      content: content.trim(),
+      content: fullContent,
       status: MessageStatus.complete,
     );
     _addMessage(userMessage);
+
+    // Sincronizar con conversación
+    _conversationController?.addMessageToActive(userMessage);
 
     // Auto-scroll después de enviar
     scrollToBottom();
 
     // Iniciar respuesta del bot con streaming
-    await _startBotResponse(content);
+    await _startBotResponse(fullContent);
   }
 
   /// Inicia la respuesta del bot con streaming
   Future<void> _startBotResponse(String userMessage) async {
     _isStreaming = true;
+    notifyListeners();
 
     // Crear mensaje vacío del bot
     final botMessage = Message(
@@ -143,6 +188,7 @@ class ChatController extends ChangeNotifier {
       status: MessageStatus.streaming,
     );
     _addMessage(botMessage);
+    _conversationController?.addMessageToActive(botMessage);
     _autoScrollIfAtBottom();
 
     // Escuchar stream de respuesta
@@ -151,6 +197,7 @@ class ChatController extends ChangeNotifier {
         .listen(
       (partialContent) {
         _updateLastBotMessage(partialContent);
+        _conversationController?.updateLastMessageInActive(partialContent);
         _autoScrollIfAtBottom();
       },
       onDone: () {
@@ -188,6 +235,10 @@ class ChatController extends ChangeNotifier {
         _messages[lastIndex] = lastMessage.copyWith(
           status: MessageStatus.complete,
         );
+        _conversationController?.updateLastMessageInActive(
+          lastMessage.content,
+          status: MessageStatus.complete,
+        );
       }
     }
 
@@ -219,7 +270,6 @@ class ChatController extends ChangeNotifier {
     _messages.add(message);
 
     // Aplicar ventana: mantener solo los últimos N mensajes en memoria
-    // Los mensajes antiguos se "paginan" desde el servicio
     if (_messages.length > _maxVisibleMessages) {
       _messages.removeAt(0);
       _hasMoreHistory = true;
@@ -238,7 +288,7 @@ class ChatController extends ChangeNotifier {
     // Guardar posición actual para restaurar después
     final previousScrollHeight = scrollController.position.maxScrollExtent;
 
-    await Future.delayed(const Duration(milliseconds: 500)); // Simular latencia
+    await Future.delayed(const Duration(milliseconds: 500));
 
     final historicalMessages = _chatService.getHistoricalMessages(
       _historyPage,
